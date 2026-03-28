@@ -1,2 +1,1120 @@
-Executable Google Earth Engine code
-Report and presentaion
+/*************************************************
+URBAN GROWTH ANALYSIS (1995–2025)
+*************************************************/
+
+//------------------------------------------------
+// 1 STUDY AREA
+//------------------------------------------------
+var table = ee.FeatureCollection("projects/my-project-x-473813/assets/dehradun_shapefile");
+var studyArea = ee.FeatureCollection(table);
+
+Map.centerObject(studyArea,9);
+Map.addLayer(studyArea,{color:'grey'},"Study Area");
+
+//---------------- DEM (TERRAIN CORRECTION) ----------------
+var dem = ee.Image("USGS/SRTMGL1_003");
+var slope = ee.Terrain.slope(dem);
+
+//------------------------------------------------
+// 2 CLOUD MASK
+//------------------------------------------------
+
+function maskCloud(image){
+
+var qa = image.select('QA_PIXEL');
+
+var mask = qa.bitwiseAnd(1<<3).eq(0)
+.and(qa.bitwiseAnd(1<<4).eq(0));
+
+return image.updateMask(mask);
+
+}
+
+
+//------------------------------------------------
+// 3 SCALE FACTOR
+//------------------------------------------------
+
+function scale(image){
+
+var optical = image.select('SR_B.*')
+.multiply(0.0000275)
+.add(-0.2);
+
+return image.addBands(optical,null,true);
+
+}
+
+
+//------------------------------------------------
+// 4 LANDSAT HARMONIZATION
+//------------------------------------------------
+
+function harmonizeL57(image){
+
+return image.select(
+['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B7'],
+['Blue','Green','Red','NIR','SWIR1','SWIR2']
+);
+
+}
+
+function harmonizeL8(image){
+
+return image.select(
+['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7'],
+['Blue','Green','Red','NIR','SWIR1','SWIR2']
+);
+
+}
+
+
+//------------------------------------------------
+// 5 SPECTRAL INDICES
+//------------------------------------------------
+
+function addIndices(image){
+
+var ndvi = image.normalizedDifference(['NIR','Red']).rename('NDVI');
+var ndbi = image.normalizedDifference(['SWIR1','NIR']).rename('NDBI');
+var mndwi = image.normalizedDifference(['Green','SWIR1']).rename('MNDWI');
+
+var bsi = image.expression(
+'((SWIR1 + Red) - (NIR + Blue)) / ((SWIR1 + Red) + (NIR + Blue))',{
+'SWIR1':image.select('SWIR1'),
+'Red':image.select('Red'),
+'NIR':image.select('NIR'),
+'Blue':image.select('Blue')
+}).rename('BSI');
+
+var ndmi = image.normalizedDifference(['NIR','SWIR1']).rename('NDMI');
+
+return image.addBands([ndvi, ndbi, mndwi, bsi, ndmi]);
+}
+
+
+//------------------------------------------------
+// 6 COMPOSITE FUNCTION
+//------------------------------------------------
+
+function getComposite(start,end,collection,harmonize){
+
+return collection
+.map(scale)
+.map(maskCloud)
+.map(harmonize)
+.filterBounds(studyArea)
+.filterDate(start,end)
+.median()
+.clip(studyArea);
+
+}
+
+
+//------------------------------------------------
+// 7 YEARLY IMAGES
+//------------------------------------------------
+
+var img1995 = addIndices(
+getComposite(
+'1994-10-01','1995-04-30',
+ee.ImageCollection("LANDSAT/LT05/C02/T1_L2"),
+harmonizeL57
+)
+);
+
+var img2000 = addIndices(
+getComposite(
+'2000-10-01','2001-04-30',
+ee.ImageCollection("LANDSAT/LT05/C02/T1_L2"),
+harmonizeL57
+)
+);
+
+var img2010 = addIndices(
+getComposite('2010-01-01','2010-12-31',
+ee.ImageCollection("LANDSAT/LE07/C02/T1_L2"),
+harmonizeL57)
+);
+
+var img2020 = addIndices(
+getComposite('2020-01-01','2020-12-31',
+ee.ImageCollection("LANDSAT/LC08/C02/T1_L2"),
+harmonizeL8)
+);
+
+var img2025 = addIndices(
+ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.map(scale)
+.map(maskCloud)
+.map(harmonizeL8)
+.filterBounds(studyArea)
+.filterDate('2025-01-01','2025-12-31')
+.median()
+.clip(studyArea)
+);
+
+
+//------------------------------------------------
+// 8 CLASSIFICATION BANDS
+//------------------------------------------------
+
+var bands=[
+'Blue','Green','Red','NIR','SWIR1','SWIR2',
+'NDVI','NDBI','MNDWI','BSI','NDMI'
+];
+
+
+//------------------------------------------------
+// 9 TRAINING DATA
+//------------------------------------------------
+
+var annual = ee.ImageCollection(
+"projects/sat-io/open-datasets/GLC-FCS30D/annual"
+);
+
+var glc = annual.mosaic();
+
+var trainingMap = glc.select('b21').clip(studyArea).remap(
+
+[10,11,12,20,
+51,52,61,62,71,72,81,82,91,92,
+120,121,122,130,140,
+150,152,153,
+181,182,183,184,185,186,187,
+190,
+200,201,202,
+210,220,0],
+
+[3,3,3,3,
+2,2,2,2,2,2,2,2,2,2,
+2,2,2,2,2,
+4,4,4,
+5,5,5,5,5,5,5,
+1,
+4,4,4,
+5,5,4]
+
+).rename("class");
+
+
+//------------------------------------------------
+// 10 TRAINING SAMPLES
+//------------------------------------------------
+
+var samples = img2020.sampleRegions({
+
+collection: trainingMap.stratifiedSample({
+
+numPoints:5000,
+classBand:"class",
+region:studyArea,
+scale:30,
+geometries:true
+
+}),
+
+properties:["class"],
+scale:30
+
+});
+
+
+//------------------------------------------------
+// 11 RANDOM FOREST
+//------------------------------------------------
+
+var classifier = ee.Classifier.smileRandomForest(500)
+.train({
+
+features:samples,
+classProperty:"class",
+inputProperties:bands
+
+});
+
+
+//------------------------------------------------
+// 12 CLASSIFICATION
+//------------------------------------------------
+
+// Urban spectral rule
+var class1995 = img1995.select(bands).classify(classifier);
+
+// detect obvious non-urban pixels (FIXED)
+var nonUrbanMask = img1995.select('NDVI').gt(0.30)  
+.or(img1995.select('MNDWI').gt(0.1));                // water
+
+// remove them from built-up class
+class1995 = class1995.where(
+class1995.eq(1).and(nonUrbanMask),
+2   // convert to vegetation
+);
+
+var waterMask = img1995.select('MNDWI').gt(0.2);
+
+class1995 = class1995.where(
+class1995.eq(5).and(waterMask.not()),
+2   // convert false water to forest
+);
+
+//---------------- DEM CORRECTION (1995) ----------------
+var lowSlope = slope.lt(15);
+
+class1995 = class1995.where(class1995.eq(3).and(lowSlope.not()), 2);
+class1995 = class1995.where(class1995.eq(1).and(slope.gt(12)), 4);
+class1995 = class1995.where(class1995.eq(5).and(slope.gt(10)), 4);
+
+//------------------------------------------------
+// CLASSIFICATION (2000) - FINAL STABLE METHOD
+//------------------------------------------------
+
+// Initial classification
+var class2000 = img2000.select(bands).classify(classifier);
+var raw = class2000;
+
+
+//================ FOREST (LOCK FIRST) =================
+
+// Strong ecological forest detection
+var forest = img2000.select('NDVI').gt(0.40)
+.and(img2000.select('NDMI').gt(0.08));
+
+// LOCK FOREST IMMEDIATELY
+class2000 = class2000.where(forest, 2);
+
+
+//================ WATER =================
+
+var water = img2000.select('MNDWI').gt(0.10)
+.and(img2000.select('MNDWI').gt(img2000.select('NDVI')))
+.and(img2000.select('NDVI').lt(0.22));
+
+// Apply only on NON-FOREST
+class2000 = class2000.where(
+  class2000.eq(5).and(water.not()).and(forest.not()),
+  4
+);
+
+
+//================ CROPLAND =================
+
+var crop = img2000.select('NDVI').gt(0.22)
+.and(img2000.select('NDVI').lt(0.48))
+.and(img2000.select('NDMI').gt(0.05))
+.and(img2000.select('NDBI').lt(-0.05));
+
+// Apply only outside forest
+class2000 = class2000.where(
+  class2000.eq(3).and(crop.not()).and(forest.not()),
+  4
+);
+
+
+//================ BUILT-UP CONTROL =================
+
+// Remove vegetation from urban (but NOT forest)
+class2000 = class2000.where(
+  class2000.eq(1)
+  .and(img2000.select('NDVI').gt(0.38))
+  .and(forest.not()),
+  3
+);
+
+
+//================ BUILT-UP RECOVERY =================
+
+class2000 = class2000.where(
+  raw.eq(1)
+  .and(img2000.select('NDBI').gt(0.12))
+  .and(img2000.select('NDVI').lt(0.30))
+  .and(forest.not()),
+  1
+);
+
+
+//================ DEM CORRECTION =================
+
+// Only modify NON-FOREST pixels
+var steep = slope.gt(15);
+
+class2000 = class2000.where(
+  class2000.eq(3).and(steep).and(forest.not()),
+  2
+);
+
+class2000 = class2000.where(
+  class2000.eq(1).and(slope.gt(12)).and(forest.not()),
+  4
+);
+
+class2000 = class2000.where(
+  class2000.eq(5).and(slope.gt(10)).and(forest.not()),
+  4
+);
+
+
+//================ FINAL GUARANTEE =================
+
+// ENSURE FOREST NEVER CHANGES
+class2000 = class2000.where(forest, 2);
+
+//------------------------------------------------
+//------------------------------------------------
+var class2010 = img2010.select(bands).classify(classifier);
+
+//---------------- WATER ----------------
+var waterMask = img2010.select('MNDWI').gt(0.15)
+.and(img2010.select('NDVI').lt(0.8))
+.and(img2010.select('NDBI').lt(0));
+
+class2010 = class2010.where(
+  class2010.eq(5).and(waterMask.not()),
+  4
+);
+
+//---------------- BUILT-UP (BALANCED FIX) ----------------
+
+// Strong urban condition
+var builtMask = img2010.select('NDBI').gt(0.10)
+.and(img2010.select('NDVI').lt(0.35))
+.and(img2010.select('MNDWI').lt(0));
+
+// Remove only clearly wrong built-up
+class2010 = class2010.where(
+  class2010.eq(1)
+  .and(img2010.select('NDVI').gt(0.40))// clearly vegetation
+  .and(img2010.select('NDMI').gt(0.05)),
+  3   // convert to cropland (NOT barren)
+);
+
+//---------------- CROPLAND (REFINED) ----------------
+var cropMask = img2010.select('NDVI').gt(0.22)
+.and(img2010.select('NDVI').lt(0.7))
+.and(img2010.select('NDMI').gt(0.05))
+.and(img2010.select('NDBI').lt(0.1))
+.and(img2010.select('BSI').lt(0.3));
+
+class2010 = class2010.where(
+  class2010.eq(3).and(cropMask.not()),
+  4
+);
+//---------------- BARREN → CROPLAND (REFINEMENT) ----------------
+
+// Detect possible cropland inside barren
+var barrenToCropMask = img2010.select('NDVI').gt(0.20)
+.and(img2010.select('NDVI').lt(0.5))
+.and(img2010.select('NDBI').lt(0.05));   // not urban
+
+// Convert selected barren to cropland
+class2010 = class2010.where(
+  class2010.eq(4).and(barrenToCropMask),
+  3
+);
+
+//---------------- DEM CORRECTION (2010) ----------------
+var lowSlope = slope.lt(15);
+
+class2010 = class2010.where(class2010.eq(3).and(lowSlope.not()), 2);
+class2010 = class2010.where(class2010.eq(1).and(slope.gt(12)), 4);
+class2010 = class2010.where(class2010.eq(5).and(slope.gt(10)), 4);
+
+//------------------------------------------------
+//------------------------------------------------
+var class2020 = img2020.select(bands).classify(classifier);
+// STRONG WATER MASK
+var waterMask = img2020.select('MNDWI').gt(0.032)
+.and(img2020.select('NDVI').lt(0.8))
+.and(img2020.select('NDBI').lt(0));
+
+// Remove false water
+class2020 = class2020.where(
+  class2020.eq(5).and(waterMask.not()),
+  4   // convert to barren
+);
+
+// STRONG CROPLAND MASK
+var cropMask = img2020.select('NDVI').gt(0.3)   // vegetation
+.and(img2020.select('NDVI').lt(0.6))           // not dense forest
+.and(img2020.select('NDBI').lt(0))              // not urban
+.and(img2020.select('NDMI').gt(0.1));             // moisture present
+
+// Remove false cropland
+class2020 = class2020.where(
+  class2020.eq(3).and(cropMask.not()),
+  4   // convert to Barren
+);
+
+//---------------- SMALL BUILT-UP → CROPLAND ADJUSTMENT ----------------
+
+// Detect weak / mixed urban pixels
+var weakUrbanToCrop = img2000.select('NDVI').gt(0.32)   // vegetation present
+.and(img2000.select('NDVI').lt(0.50))                  // not dense forest
+.and(img2000.select('NDBI').lt(0.12));                 // weak urban signal
+
+// Convert small portion of built-up to cropland
+class2000 = class2000.where(
+  class2000.eq(1).and(weakUrbanToCrop),
+  3
+);
+
+//---------------- DEM CORRECTION (2020) ----------------
+var lowSlope = slope.lt(15);
+
+class2020 = class2020.where(class2020.eq(3).and(lowSlope.not()), 2);
+class2020 = class2020.where(class2020.eq(1).and(slope.gt(12)), 4);
+class2020 = class2020.where(class2020.eq(5).and(slope.gt(10)), 4);
+
+//------------------------------------------------
+//------------------------------------------------
+var class2025 = img2025.select(bands).classify(classifier);
+// STRONG WATER MASK
+var waterMask = img2025.select('MNDWI').gt(0.032)
+.and(img2025.select('NDVI').lt(0.8))
+.and(img2025.select('NDBI').lt(0));
+
+// Remove false water
+class2025 = class2025.where(
+  class2025.eq(5).and(waterMask.not()),
+  4   // convert to barren
+);
+
+// STRONG CROPLAND MASK
+var cropMask = img2025.select('NDVI').gt(0.3)   // vegetation
+.and(img2025.select('NDVI').lt(0.6))           // not dense forest
+.and(img2025.select('NDBI').lt(0))              // not urban
+.and(img2025.select('NDMI').gt(0.1));             // moisture present
+
+// Remove false cropland
+class2025 = class2025.where(
+  class2025.eq(3).and(cropMask.not()),
+  4   // convert to Barren
+);
+
+//---------------- BUILT-UP → CROPLAND FIX ----------------
+
+// Detect cropland inside built-up
+var builtToCrop = img2025.select('NDVI').gt(0.35)
+.and(img2025.select('NDVI').lt(0.7))
+.and(img2025.select('NDMI').gt(0.1))
+.and(img2025.select('NDBI').lt(0.08));   // weak urban
+
+// Convert those pixels to cropland
+class2025 = class2025.where(
+  class2025.eq(1).and(builtToCrop),
+  3
+);
+
+//---------------- BUILT-UP RECOVERY (IMPORTANT) ----------------
+
+// Detect true urban pixels
+var urbanRecover = img2025.select('NDBI').gt(0.6)   // strong urban
+.and(img2025.select('NDVI').lt(0.35))                // low vegetation
+.and(img2025.select('MNDWI').lt(0));                 // not water
+
+// Restore built-up
+class2025 = class2025.where(
+  urbanRecover,
+  1
+);
+
+//---------------- DEM CORRECTION (2025) ----------------
+var lowSlope = slope.lt(15);
+
+class2025 = class2025.where(class2025.eq(3).and(lowSlope.not()), 2);
+class2025 = class2025.where(class2025.eq(1).and(slope.gt(12)), 4);
+class2025 = class2025.where(class2025.eq(5).and(slope.gt(10)), 4);
+
+//------------------------------------------------
+// 13 VISUALIZATION
+//------------------------------------------------
+
+var vis={
+min:1,
+max:5,
+palette:[
+'red',
+'006400',
+'ffff00',
+'c2b280',
+'419BDF'
+]
+};
+
+Map.addLayer(class1995,vis,"LULC 1995");
+Map.addLayer(class2000,vis,"LULC 2000");
+Map.addLayer(class2010,vis,"LULC 2010");
+Map.addLayer(class2020,vis,"LULC 2020");
+Map.addLayer(class2025,vis,"LULC 2025");
+
+
+//------------------------------------------------
+// 14 ACCURACY
+//------------------------------------------------
+
+var validation = samples.randomColumn();
+
+var trainSet = validation.filter('random < 0.7');
+var testSet = validation.filter('random >= 0.7');
+
+var trainedClassifier = ee.Classifier.smileRandomForest(400)
+.train({
+features:trainSet,
+classProperty:'class',
+inputProperties:bands
+});
+
+var validated = testSet.classify(trainedClassifier);
+
+var confusionMatrix = validated.errorMatrix('class','classification');
+
+print('Confusion Matrix',confusionMatrix);
+print('Overall Accuracy',confusionMatrix.accuracy());
+print('Kappa',confusionMatrix.kappa());
+
+
+//------------------------------------------------
+// 15 URBAN CHANGE
+//------------------------------------------------
+
+var built1995 = class1995.eq(1);
+var built2000 = class2000.eq(1);
+var built2010 = class2010.eq(1);
+var built2020 = class2020.eq(1);
+var built2025 = class2025.eq(1);
+
+var urban95_00 = built2000.and(built1995.not());
+Map.addLayer(urban95_00,{palette:['white','red']},"New Urban 1995-2000");
+
+var urban00_10 = built2010.and(built2000.not());
+Map.addLayer(urban00_10,{palette:['white','red']},"New Urban 2000-2010");
+
+var urban10_20 = built2020.and(built2010.not());
+Map.addLayer(urban10_20,{palette:['white','red']},"New Urban 2010-2020");
+
+var urban20_25 = built2025.and(built2020.not());
+Map.addLayer(urban20_25,{palette:['white','red']},"New Urban 2020-2025");
+
+var urban95_25 = built2025.and(built1995.not());
+Map.addLayer(urban95_25,{palette:['white','red']},"New Urban 1995-2025");
+
+
+
+//------------------------------------------------
+// 16 BUILT-UP AREA VALUES
+//------------------------------------------------
+
+// function to calculate built-up area
+function builtArea(img){
+  return ee.Image.pixelArea()
+    .updateMask(img.eq(1))
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: studyArea.geometry(),
+      scale: 200,       // large scale prevents memory errors
+      bestEffort: true
+    })
+    .getNumber('area')
+    .divide(1000000);   // convert to km²
+}
+
+// calculate for each year
+var built95 = builtArea(class1995);
+var built00 = builtArea(class2000);
+var built10 = builtArea(class2010);
+var built20 = builtArea(class2020);
+var built25 = builtArea(class2025);
+
+print('Built-up 1995 km2', built95);
+print('Built-up 2000 km2', built00);
+print('Built-up 2010 km2', built10);
+print('Built-up 2020 km2', built20);
+print('Built-up 2025 km2', built25);
+
+//------------------------------------------------
+// BUILT-UP AREA GRAPH
+//------------------------------------------------
+var chart = ui.Chart.array.values({
+  array: ee.Array([
+    built95,
+    built00,
+    built10,
+    built20,
+    built25
+  ]),
+  axis: 0,
+  xLabels: ['1995','2000','2010','2020','2025']
+})
+.setSeriesNames(['Area'])   // <- this changes [x] to Area
+.setChartType('LineChart')
+.setOptions({
+  title: 'Total Built-up Area',
+  hAxis: {title: 'Year'},
+  vAxis: {title: 'Built-up Area (km²)'},
+  lineWidth: 3,
+  pointSize: 6
+});
+
+print(chart);
+
+//------------------------------------------------
+// DASHBOARD LAYOUT (3 PANELS)
+//------------------------------------------------
+
+ui.root.clear();
+
+var leftPanel = ui.Panel({
+  style:{width:'320px', padding:'10px'}
+});
+
+var mapPanel = ui.Panel({
+  style:{stretch:'both'}
+});
+
+var rightPanel = ui.Panel({
+  style:{width:'320px', padding:'10px'}
+});
+
+ui.root.add(leftPanel);
+ui.root.add(mapPanel);
+ui.root.add(rightPanel);
+
+
+//------------------------------------------------
+// TITLE
+//------------------------------------------------
+
+leftPanel.add(ui.Label('Urban Growth Dashboard',{
+  fontSize:'22px',
+  fontWeight:'bold'
+}));
+
+leftPanel.add(ui.Label('Compare urban growth (1995–2025)'));
+
+
+//------------------------------------------------
+// SWIPE MAP
+//------------------------------------------------
+
+var leftMap = ui.Map();
+var rightMap = ui.Map();
+
+leftMap.centerObject(studyArea,9);
+rightMap.centerObject(studyArea,9);
+
+// Link maps
+ui.Map.Linker([leftMap, rightMap]);
+
+// Swipe
+var swipe = ui.SplitPanel({
+  firstPanel:leftMap,
+  secondPanel:rightMap,
+  orientation:'horizontal',
+  wipe:true,
+  style:{stretch:'both'}
+});
+
+mapPanel.add(swipe);
+
+
+//------------------------------------------------
+// YEAR SELECTORS
+//------------------------------------------------
+
+var years = ['1995','2000','2010','2020','2025'];
+
+var select1 = ui.Select({
+  items:years,
+  value:'2020',
+  onChange:updateMap1
+});
+
+var select2 = ui.Select({
+  items:years,
+  value:'2025',
+  onChange:updateMap2
+});
+
+leftPanel.add(ui.Label('Before Year'));
+leftPanel.add(select1);
+
+leftPanel.add(ui.Label('After Year'));
+leftPanel.add(select2);
+
+
+//------------------------------------------------
+// IMAGE FUNCTION
+//------------------------------------------------
+
+function getImage(year){
+  if(year==='1995') return class1995;
+  if(year==='2000') return class2000;
+  if(year==='2010') return class2010;
+  if(year==='2020') return class2020;
+  if(year==='2025') return class2025;
+}
+
+
+//------------------------------------------------
+// MAP UPDATE
+//------------------------------------------------
+
+function updateMap1(year){
+  leftMap.layers().reset();
+  leftMap.addLayer(studyArea,{color:'black'},'Boundary',false);
+  leftMap.addLayer(getImage(year),vis,'LULC '+year);
+}
+
+function updateMap2(year){
+  rightMap.layers().reset();
+  rightMap.addLayer(studyArea,{color:'black'},'Boundary',false);
+  rightMap.addLayer(getImage(year),vis,'LULC '+year);
+}
+
+updateMap1('1995');
+updateMap2('2025');
+
+
+//------------------------------------------------
+// BUILT-UP GRAPH
+//------------------------------------------------
+
+var chart = ui.Chart.array.values({
+  array: ee.Array([
+    built95,
+    built00,
+    built10,
+    built20,
+    built25
+  ]),
+  axis: 0,
+  xLabels: ['1995','2000','2010','2020','2025']
+})
+.setChartType('LineChart')
+.setSeriesNames(['Built-up Area'])
+.setOptions({
+  title: 'Urban Growth (Built-up Area)',
+  
+  hAxis: {
+    title: 'Year',
+    gridlines: {count: 5}
+  },
+
+  vAxis: {
+    title: 'Area (km²)',
+    gridlines: {count: 6}
+  },
+
+  lineWidth: 2,
+  pointSize: 4,
+
+  legend: {position: 'bottom'},
+  interpolateNulls: true
+});
+
+leftPanel.add(chart);
+
+
+//------------------------------------------------
+// LEGEND
+//------------------------------------------------
+
+var legend = ui.Panel({
+  style:{position:'bottom-left', padding:'8px'}
+});
+
+legend.add(ui.Label('LULC Classes',{fontWeight:'bold'}));
+
+var palette = ['red','006400','ffff00','c2b280','419BDF'];
+var names = ['Built-up','Forest','Cropland','Barren','Water'];
+
+for (var i=0;i<names.length;i++){
+  legend.add(ui.Panel([
+    ui.Label('',{backgroundColor:palette[i], padding:'8px'}),
+    ui.Label(names[i])
+  ],ui.Panel.Layout.Flow('horizontal')));
+}
+
+leftMap.add(legend);
+
+
+//------------------------------------------------
+// RIGHT ANALYSIS PANEL
+//------------------------------------------------
+
+rightPanel.add(ui.Label('Analysis Panel',{
+  fontSize:'18px',
+  fontWeight:'bold'
+}));
+
+var infoPanel = ui.Panel();
+infoPanel.add(ui.Label('Click map to analyze'));
+
+rightPanel.add(infoPanel);
+
+
+//------------------------------------------------
+// CLICK ANALYSIS TOOL
+//------------------------------------------------
+
+// Cursor
+leftMap.style().set('cursor','crosshair');
+rightMap.style().set('cursor','crosshair');
+
+// Markers
+var marker1 = ui.Map.Layer(null,{color:'yellow'},'Point');
+var marker2 = ui.Map.Layer(null,{color:'yellow'},'Point');
+
+leftMap.layers().add(marker1);
+rightMap.layers().add(marker2);
+
+
+//------------------------------------------------
+// CLICK FUNCTION
+//------------------------------------------------
+
+function runClick(coords){
+
+  var point = ee.Geometry.Point(coords.lon, coords.lat);
+
+  marker1.setEeObject(point);
+  marker2.setEeObject(point);
+
+  infoPanel.clear();
+
+  // Location
+  infoPanel.add(ui.Label('Location',{fontWeight:'bold'}));
+  infoPanel.add(ui.Label('Lon: '+coords.lon.toFixed(4)));
+  infoPanel.add(ui.Label('Lat: '+coords.lat.toFixed(4)));
+
+  infoPanel.add(ui.Button('Reset',function(){
+    infoPanel.clear();
+    infoPanel.add(ui.Label('Click map to analyze'));
+  }));
+
+
+  //------------------------------------------------
+  // CLASS VALUES
+  //------------------------------------------------
+
+  function getClass(img,label){
+
+    img.sample({
+      region:point,
+      scale:30,
+      numPixels:1
+    }).evaluate(function(res){
+
+      if(res.features.length>0){
+
+        var c = res.features[0].properties.classification;
+
+        var names = {
+          1:'Built-up',
+          2:'Forest',
+          3:'Cropland',
+          4:'Barren',
+          5:'Water'
+        };
+
+        infoPanel.add(ui.Label(label+': '+names[c]));
+      }
+
+    });
+  }
+
+  getClass(leftMap.layers().get(1).getEeObject(),'Before');
+  getClass(rightMap.layers().get(1).getEeObject(),'After');
+
+
+  //------------------------------------------------
+  // PIE CHARTS
+  //------------------------------------------------
+
+  function makeChart(img,title){
+
+    var hist = img.reduceRegion({
+      reducer:ee.Reducer.frequencyHistogram(),
+      geometry:point.buffer(1000),
+      scale:30,
+      bestEffort:true
+    });
+
+    var d = ee.Dictionary(hist.get('classification'));
+
+    var f = ee.Feature(null,{
+      'Built-up':d.get('1',0),
+      'Forest':d.get('2',0),
+      'Cropland':d.get('3',0),
+      'Barren':d.get('4',0),
+      'Water':d.get('5',0)
+    });
+
+    return ui.Chart.feature.byProperty(f)
+    .setChartType('PieChart')
+    .setOptions({
+      title:title,
+      slices:{
+        0:{color:'red'},
+        1:{color:'006400'},
+        2:{color:'ffff00'},
+        3:{color:'c2b280'},
+        4:{color:'419BDF'}
+      }
+    });
+  }
+
+  infoPanel.add(makeChart(
+    leftMap.layers().get(1).getEeObject(),
+    'Before (1 km)'
+  ));
+
+  infoPanel.add(makeChart(
+    rightMap.layers().get(1).getEeObject(),
+    'After (1 km)'
+  ));
+}
+
+
+//------------------------------------------------
+// APPLY CLICK
+//------------------------------------------------
+
+leftMap.onClick(runClick);
+rightMap.onClick(runClick);
+
+//------------------------------------------------
+// 17. EXPORT MODULE
+//------------------------------------------------
+
+
+//================================================
+// 17.1 EXPORT LULC MAPS (GeoTIFF)
+//================================================
+
+function exportImage(img, name){
+  Export.image.toDrive({
+    image: img,
+    description: name,
+    folder: 'GEE_Urban',
+    fileNamePrefix: name,
+    region: studyArea.geometry(),
+    scale: 30,
+    maxPixels: 1e13
+  });
+}
+
+// LULC Maps
+exportImage(class1995, 'LULC_1995');
+exportImage(class2000, 'LULC_2000');
+exportImage(class2010, 'LULC_2010');
+exportImage(class2020, 'LULC_2020');
+exportImage(class2025, 'LULC_2025');
+
+
+//================================================
+// 17.2 EXPORT URBAN CHANGE MAPS
+//================================================
+
+exportImage(urban95_00, 'Urban_1995_2000');
+exportImage(urban00_10, 'Urban_2000_2010');
+exportImage(urban10_20, 'Urban_2010_2020');
+exportImage(urban20_25, 'Urban_2020_2025');
+exportImage(urban95_25, 'Urban_1995_2025');
+
+
+//================================================
+// 17.3 EXPORT BUILT-UP AREA TABLE (CSV)
+//================================================
+
+var statsTable = ee.FeatureCollection([
+  ee.Feature(null, {Year:1995, Area_km2: built95}),
+  ee.Feature(null, {Year:2000, Area_km2: built00}),
+  ee.Feature(null, {Year:2010, Area_km2: built10}),
+  ee.Feature(null, {Year:2020, Area_km2: built20}),
+  ee.Feature(null, {Year:2025, Area_km2: built25})
+]);
+
+Export.table.toDrive({
+  collection: statsTable,
+  description: 'BuiltUp_Area_Table',
+  fileFormat: 'CSV'
+});
+
+
+//================================================
+// 17.4 EXPORT ACCURACY REPORT
+//================================================
+
+var accuracyTable = ee.FeatureCollection([
+  ee.Feature(null, {
+    Overall_Accuracy: confusionMatrix.accuracy(),
+    Kappa: confusionMatrix.kappa()
+  })
+]);
+
+Export.table.toDrive({
+  collection: accuracyTable,
+  description: 'Accuracy_Report',
+  fileFormat: 'CSV'
+});
+
+
+//================================================
+// 17.5 EXPORT FULL CONFUSION MATRIX
+//================================================
+
+var cmArray = ee.Array(confusionMatrix.array());
+
+var cmTable = ee.FeatureCollection([
+  ee.Feature(null, {Confusion_Matrix: cmArray})
+]);
+
+Export.table.toDrive({
+  collection: cmTable,
+  description: 'Confusion_Matrix_Full',
+  fileFormat: 'CSV'
+});
+
+
+//================================================
+// 17.6 EXPORT LULC CLASS AREA (ALL YEARS)
+//================================================
+
+function classArea(img, year){
+
+  var area = ee.Image.pixelArea().addBands(img)
+    .reduceRegion({
+      reducer: ee.Reducer.sum().group({
+        groupField: 1,
+        groupName: 'class'
+      }),
+      geometry: studyArea,
+      scale: 30,
+      bestEffort: true
+    });
+
+  var groups = ee.List(area.get('groups'));
+
+  return ee.FeatureCollection(groups.map(function(g){
+    g = ee.Dictionary(g);
+    return ee.Feature(null,{
+      Year: year,
+      Class: g.get('class'),
+      Area_km2: ee.Number(g.get('sum')).divide(1e6)
+    });
+  }));
+}
+
+// Merge all years
+var allStats = classArea(class1995,1995)
+.merge(classArea(class2000,2000))
+.merge(classArea(class2010,2010))
+.merge(classArea(class2020,2020))
+.merge(classArea(class2025,2025));
+
+Export.table.toDrive({
+  collection: allStats,
+  description: 'LULC_Class_Area_All_Years',
+  fileFormat: 'CSV'
+});
